@@ -1,0 +1,164 @@
+name: Mac runner probe
+
+# Measures how GitHub's free Mac runners run Dusty's published engine, using
+# only files that are already public in dusty-corporation/dusty releases and
+# its public source snapshot. No Dusty code is built or run here.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3]
+    runs-on: macos-15
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PUBLIC: dusty-corporation/dusty
+      SNAPSHOT: c0c432a5295ba375db8742a0726b900e5d9b382f
+    steps:
+      - name: Record the runner
+        run: |
+          sw_vers
+          uname -m
+          for key in machdep.cpu.brand_string hw.physicalcpu hw.logicalcpu hw.memsize \
+            kern.hv_vmm_present hw.nperflevels hw.perflevel0.physicalcpu \
+            hw.perflevel0.logicalcpu hw.perflevel1.physicalcpu hw.optional.arm.FEAT_SME \
+            hw.optional.arm.FEAT_BF16 hw.optional.arm.FEAT_I8MM; do
+            printf '%s = %s\n' "$key" "$(sysctl -n "$key" 2>/dev/null || echo unavailable)"
+          done
+          uptime
+
+      - name: Download and verify the published engine, model and audio
+        run: |
+          set -euo pipefail
+          mkdir -p dl work
+          gh release download engine-macos-v1 --repo "$PUBLIC" --dir dl \
+            --pattern whisper-cpu-macos-arm64.zip --pattern whisper-metal-macos-arm64.zip \
+            --pattern ffmpeg-macos-arm64.zip
+          gh release download models-v1 --repo "$PUBLIC" --dir dl \
+            --pattern ggml-tiny.bin --pattern ggml-silero-vad.bin
+          audio="https://raw.githubusercontent.com/$PUBLIC/$SNAPSHOT/tests/fixtures/audio"
+          curl -fsSL -o dl/jfk.wav "$audio/formats/jfk.wav"
+          curl -fsSL -o dl/mostly-silence-10min.m4a "$audio/vad/mostly-silence-10min.m4a"
+          # Hashes pinned in Dusty's native/versions.toml and resources/models.json.
+          printf '%s  %s\n' \
+            b384b21d068441e4095d035d4420077585a5e1a177723332d4e4fc6ccb6d2ebb whisper-cpu-macos-arm64.zip \
+            aa27cfeb79144de33d01a5fd0374a283466de880a45c85469355eb30d3c33a31 whisper-metal-macos-arm64.zip \
+            0f436373ca3f2de9c35dbe0b1b84fd2bdef1aa01ab165eff38bd7254f194c636 ffmpeg-macos-arm64.zip \
+            a38bcb31dcd68cf7d9a630e2148ccf0656f95ac87c5bcbc4064a689f383b2059 ggml-tiny.bin \
+            abd79739d3ff4bc37fa1d24f1fca8244f2e31ec9f0bb7ea6244b185bfaa0b8e6 ggml-silero-vad.bin \
+            59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e jfk.wav \
+            6547892b3469d27d789bd440d8d8c2971fbe6b2625a7a320307f46bae2cde448 mostly-silence-10min.m4a \
+            > dl/expected.txt
+          (cd dl && shasum -a 256 -c expected.txt)
+          for name in whisper-cpu whisper-metal ffmpeg; do
+            mkdir -p "work/$name"
+            unzip -q "dl/$name-macos-arm64.zip" -d "work/$name"
+          done
+          cpu=$(find "$PWD/work/whisper-cpu" -type f -name whisper-cli | head -1)
+          metal=$(find "$PWD/work/whisper-metal" -type f -name whisper-cli | head -1)
+          ffmpeg=$(find "$PWD/work/ffmpeg" -type f -name ffmpeg | head -1)
+          chmod +x "$cpu" "$metal" "$ffmpeg"
+          printf 'CPU_CLI=%s\nMETAL_CLI=%s\nFFMPEG=%s\n' "$cpu" "$metal" "$ffmpeg" | tee -a "$GITHUB_ENV"
+          # run.sh LABEL LIMIT_SECONDS COMMAND...: one timed run, never failing the step.
+          cat > run.sh <<'SCRIPT'
+          #!/bin/bash
+          label=$1; limit=$2; shift 2
+          start=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+          perl -e 'alarm shift; exec @ARGV or die "exec failed: $!\n"' "$limit" "$@" > "out-$label.txt" 2>&1
+          code=$?
+          end=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+          secs=$(perl -e "printf '%.1f', $end - $start")
+          timing=$(grep -a -m1 -o 'total time = *[0-9.]* ms' "out-$label.txt" || true)
+          printf '%-24s exit %3s  %8s s  %s\n' "$label" "$code" "$secs" "$timing"
+          SCRIPT
+          chmod +x run.sh
+
+      - name: Processor engine, 11 seconds of speech, 1 to 4 threads
+        run: |
+          for threads in 1 2 3 4; do
+            ./run.sh "cpu-t$threads" 240 "$CPU_CLI" -m dl/ggml-tiny.bin -f dl/jfk.wav -l en -t "$threads" -ng
+          done
+          grep -a -h "system_info\|using BLAS\|no GPU" out-cpu-t3.txt | head -3
+
+      - name: Same, with Accelerate limited to one thread
+        env:
+          VECLIB_MAXIMUM_THREADS: 1
+        run: |
+          for threads in 1 3; do
+            ./run.sh "cpu-t$threads-veclib1" 240 "$CPU_CLI" -m dl/ggml-tiny.bin -f dl/jfk.wav -l en -t "$threads" -ng
+          done
+
+      - name: Accelerate matrix multiply speed
+        run: |
+          cat > sgemm.py <<'SCRIPT'
+          import array
+          import ctypes
+          import os
+          import sys
+          import time
+
+          accelerate = ctypes.CDLL("/System/Library/Frameworks/Accelerate.framework/Accelerate")
+          sgemm = accelerate.cblas_sgemm
+          sgemm.restype = None
+          sgemm.argtypes = [ctypes.c_int] * 6 + [
+              ctypes.c_float, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
+              ctypes.c_float, ctypes.c_void_p, ctypes.c_int,
+          ]
+          n = int(sys.argv[1])
+          a = array.array("f", [1.0]) * (n * n)
+          b = array.array("f", [0.5]) * (n * n)
+          c = array.array("f", [0.0]) * (n * n)
+          pointers = [buffer.buffer_info()[0] for buffer in (a, b, c)]
+
+          def multiply():
+              sgemm(101, 111, 111, n, n, n, 1.0, pointers[0], n, pointers[1], n, 0.0, pointers[2], n)
+
+          multiply()
+          best = None
+          for _ in range(5):
+              began = time.perf_counter()
+              multiply()
+              elapsed = time.perf_counter() - began
+              best = elapsed if best is None else min(best, elapsed)
+          limit = os.environ.get("VECLIB_MAXIMUM_THREADS", "unset")
+          print(f"sgemm {n}: best {best * 1000:.1f} ms, {2 * n**3 / best / 1e9:.1f} GFLOPS, VECLIB_MAXIMUM_THREADS={limit}")
+          SCRIPT
+          for size in 256 1024; do
+            perl -e 'alarm shift; exec @ARGV' 120 python3 sgemm.py "$size" || echo "sgemm $size: exit $?"
+            VECLIB_MAXIMUM_THREADS=1 perl -e 'alarm shift; exec @ARGV' 120 python3 sgemm.py "$size" || echo "sgemm $size single thread: exit $?"
+          done
+
+      - name: Speech detection over 10 minutes of mostly silence, as in the stuck test
+        run: |
+          "$FFMPEG" -hide_banner -loglevel error -i dl/mostly-silence-10min.m4a -ar 16000 -ac 1 -c:a pcm_s16le work/silence.wav
+          ./run.sh cpu-vad-t3 480 "$CPU_CLI" -m dl/ggml-tiny.bin -f work/silence.wav -l en -t 3 -ng --vad -vm dl/ggml-silero-vad.bin
+          VECLIB_MAXIMUM_THREADS=1 ./run.sh cpu-vad-t3-veclib1 480 "$CPU_CLI" -m dl/ggml-tiny.bin -f work/silence.wav -l en -t 3 -ng --vad -vm dl/ggml-silero-vad.bin
+
+      - name: Metal engine for comparison, two minute limit
+        run: |
+          ./run.sh metal-t3 120 "$METAL_CLI" -m dl/ggml-tiny.bin -f dl/jfk.wav -l en -t 3
+          grep -a -c "compiled .* library" out-metal-t3.txt || true
+          grep -a "GPU name\|simdgroup\|loaded [0-9]* libraries" out-metal-t3.txt || true
+          tail -n 3 out-metal-t3.txt
+
+      - name: Summary of every timed run
+        if: always()
+        run: |
+          uptime
+          for file in out-*.txt; do
+            echo "== $file"
+            grep -a "system_info\|total time\|n_threads\|using BLAS" "$file" | head -4 || true
+          done
