@@ -5,8 +5,6 @@ name: Mac runner probe
 # its public source snapshot. No Dusty code is built or run here.
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
