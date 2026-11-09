@@ -1,0 +1,103 @@
+name: Candidate Mac job with an unpublished engine
+
+# Runs the macos job of Dusty's ci.yml on a candidate branch whose Mac engine pin
+# names an engine that is built but not yet published. The steps are copied from
+# ci.yml; the only added step puts that engine's archives, from a native-macos.yml
+# run in this repository, where tools/fetch_dev_binaries.py looks for them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Candidate branch
+        required: true
+        default: candidate-1.1.3
+      engine_run:
+        description: The native-macos.yml run that built the pinned Mac engine
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  macos:
+    runs-on: macos-15
+    # ci.yml allows 90 minutes; here the job may run longer, to measure it.
+    timeout-minutes: 150
+    env:
+      QT_QPA_PLATFORM: offscreen
+      UV_PYTHON_PREFERENCE: only-managed
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.candidate }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned Python and locked dependencies
+        # The app bundles this interpreter: python-build-standalone 3.12.11, whose
+        # libraries match the license texts in packaging/macos/licenses.
+        run: |
+          python -m pip install uv==0.8.18
+          uv python install 3.12.11
+          uv sync --locked --python 3.12.11
+          uv run python -c "import decimal, sys; print(sys.version, decimal.__libmpdec_version__)"
+      - name: Record the runner
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n machdep.cpu.brand_string hw.physicalcpu hw.logicalcpu hw.memsize
+          sysctl -n kern.hv_vmm_present hw.perflevel0.physicalcpu
+      - name: Put the built, unpublished engine where the fetch looks for it
+        # The only step that ci.yml does not have. The fetch below still checks
+        # each archive against the candidate's pinned hash before using it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENGINE_RUN: ${{ inputs.engine_run }}
+        run: |
+          gh run download "$ENGINE_RUN" --repo "$GITHUB_REPOSITORY" --name engine-macos-arm64 --dir build/downloads
+          ls -l build/downloads
+      - name: Fetch the pinned Mac engine and verified development models
+        run: uv run python tools/fetch_dev_binaries.py
+      - name: Mac source policies
+        run: |
+          for tool in check_docs.py check_no_network.py check_no_huggingface.py check_licenses.py check_workflow_budget.py; do
+            uv run python "tools/$tool"
+          done
+      - name: Tests, with the pinned Mac engine and models for the Mac integration tests
+        # -rs lists why tests skipped, such as Metal tests on a virtual Mac's GPU.
+        # A test still running after 10 minutes prints every thread's stack.
+        run: |
+          export DUSTY_BIN_DIR="$PWD/build/bin" DUSTY_MODELS_DIR="$PWD/build/models"
+          uv run pytest -q -rs --durations=20 -o faulthandler_timeout=600
+      - name: Build Dusty.app from the pinned Mac engine
+        run: uv run python -m tools.build_macos_app build/mac-app --native-root build/engine-macos/macos-arm64
+      - name: Built app tests
+        run: |
+          export DUSTY_MAC_APP="$PWD/build/mac-app/Dusty.app" DUSTY_MODELS_DIR="$PWD/build/models"
+          uv run pytest -q tests/integration/test_mac_upgrade.py
+      - name: Audit the app bundle, signatures and notices
+        run: uv run python -m tools.check_macos_bundle build/mac-app/Dusty.app --json build/mac-app/bundle-check.json
+      - name: Build and verify the disk image
+        run: uv run python -m tools.build_macos_dmg build/mac-app/Dusty.app build/mac-dmg
+      - name: Headless self-test, upgrade, removal and moved app scenarios
+        run: uv run python -m tools.mac_upgrade_check --new build/mac-app/Dusty.app --models build/models --out build/mac-upgrade
+      - name: Software bill of materials and release inputs
+        run: |
+          uv run python -m tools.macos_sbom build/mac-app/Dusty.app build/mac-app/audit/notices-inventory.json build/mac-release/sbom.cdx.json
+          cp build/mac-dmg/* build/mac-release/
+          cp build/mac-app/bundle-check.json build/mac-upgrade/results.json build/mac-release/
+          cp build/mac-app/Dusty.app/Contents/Resources/THIRD_PARTY_NOTICES.md build/mac-release/
+          cp native/macos/build_ffmpeg.sh build/mac-release/build_ffmpeg-macos.sh
+          ls -l build/mac-release
+      - name: Preserve the unsigned disk image as a CI artifact only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mac-dmg-draft-unsigned
+          path: build/mac-release
+          if-no-files-found: error

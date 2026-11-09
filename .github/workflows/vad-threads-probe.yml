@@ -5,8 +5,6 @@ name: Speech detection threads probe
 # from the candidate branch, which adds the speech detection threads patch.
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
