@@ -104,8 +104,13 @@ native/patches/0002-vad-timestamps-and-threads.patch, pinned in the
 so that speech detection never uses more threads than the run. Dusty runs at
 most 4 threads, so where it runs 4, as on every Mac with at least 4
 performance cores, nothing changes. Transcripts and timestamps from the
-patched engine match the published one exactly with 1 to 4 threads. The
-rebuilt engine is engine-macos-v2. The Windows engine keeps patch 0001 until
+patched engine match the published one exactly with 1 to 4 threads. On two M1
+runners (staging run 42542594477) the patched engine finished the same speech
+detection run in 2.1 to 3.3 seconds with 1 to 3 threads, with the same
+transcript as on the M2 Mac, while the published engine was still running at
+300 seconds and the patched engine with 4 threads at 180 seconds. The rebuilt
+engine, engine-macos-v2 (staging run 42542628054), differs from
+engine-macos-v1 only in libwhisper. The Windows engine keeps patch 0001 until
 its next build, so on a Windows PC with fewer than 4 logical processors, Skip
 long silences can still be very slow.
 
