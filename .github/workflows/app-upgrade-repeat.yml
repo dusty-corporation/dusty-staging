@@ -1,0 +1,109 @@
+name: Built app upgrade check, repeated
+
+# Builds Dusty.app from a candidate with its built, unpublished Mac engine, as
+# candidate-macos.yml does, and runs tools/mac_upgrade_check.py several times on
+# each runner, to find why one self-test row failed once on an M1 runner
+# (candidate-macos run 42543828935, attempt 1). For each failed row it prints
+# that scenario's Dusty log, which holds only status codes, and any macOS crash
+# report of a Dusty program.
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Candidate branch
+        required: true
+        default: candidate-1.1.3
+      engine_run:
+        description: The native-macos.yml run that built the pinned Mac engine
+        required: true
+      repeats:
+        description: Upgrade checks per runner
+        required: true
+        default: '6'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  repeat:
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3]
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      QT_QPA_PLATFORM: offscreen
+      UV_PYTHON_PREFERENCE: only-managed
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.candidate }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Install the pinned Python and locked dependencies
+        # The app bundles this interpreter: python-build-standalone 3.12.11, whose
+        # libraries match the license texts in packaging/macos/licenses.
+        run: |
+          python -m pip install uv==0.8.18
+          uv python install 3.12.11
+          uv sync --locked --python 3.12.11
+          uv run python -c "import decimal, sys; print(sys.version, decimal.__libmpdec_version__)"
+      - name: Record the runner
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n machdep.cpu.brand_string hw.physicalcpu hw.logicalcpu hw.memsize
+          sysctl -n kern.hv_vmm_present hw.perflevel0.physicalcpu
+      - name: Put the built, unpublished engine where the fetch looks for it
+        # The only step that ci.yml does not have. The fetch below still checks
+        # each archive against the candidate's pinned hash before using it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENGINE_RUN: ${{ inputs.engine_run }}
+        run: |
+          gh run download "$ENGINE_RUN" --repo "$GITHUB_REPOSITORY" --name engine-macos-arm64 --dir build/downloads
+          ls -l build/downloads
+      - name: Fetch the pinned Mac engine and verified development models
+        run: uv run python tools/fetch_dev_binaries.py
+      - name: Build Dusty.app from the pinned Mac engine
+        run: uv run python -m tools.build_macos_app build/mac-app --native-root build/engine-macos/macos-arm64
+      - name: Upgrade check, repeated
+        env:
+          REPEATS: ${{ inputs.repeats }}
+        run: |
+          set +e  # Keep going after a failed check to report every run.
+          failed_runs=0
+          for i in $(seq 1 "$REPEATS"); do
+            out="build/upgrade-$i"
+            started=$(date +%s)
+            uv run python -m tools.mac_upgrade_check --new build/mac-app/Dusty.app --models build/models \
+              --out "$out" --no-quarantine > "build/upgrade-$i.txt" 2>&1
+            code=$?
+            echo "run $i: exit $code in $(( $(date +%s) - started )) s, $(grep -a -E 'rows, [0-9]+ failed' "build/upgrade-$i.txt")"
+            if [ "$code" -ne 0 ]; then
+              failed_runs=$((failed_runs + 1))
+              grep -a '^\[fail\]' "build/upgrade-$i.txt"
+              for log in "$out"/p*/home/Library/Application\ Support/Dusty/logs/dusty.log; do
+                [ -f "$log" ] || continue
+                echo "--- $(echo "$log" | sed -E 's|.*/(p[0-9]+)/home/.*|\1|') dusty.log"
+                tail -n 40 "$log"
+              done
+            fi
+          done
+          echo "upgrade checks with a failed row: $failed_runs of $REPEATS"
+          echo "--- crash reports of Dusty programs"
+          ls -l ~/Library/Logs/DiagnosticReports 2>/dev/null | grep -a -i -E 'whisper|ffmpeg|ffprobe|lifeline|dusty' || echo none
+          for report in ~/Library/Logs/DiagnosticReports/*; do
+            case "$report" in *whisper*|*ffmpeg*|*ffprobe*|*lifeline*|*Dusty*|*dusty*) ;; *) continue ;; esac
+            echo "== $report"
+            grep -a -m 12 -E '"exception"|"type"|"signal"|"termination"|"codes"|"procName"|"faultingThread"' "$report"
+          done
+          test "$failed_runs" -eq 0
