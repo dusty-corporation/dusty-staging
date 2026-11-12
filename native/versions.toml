@@ -1,0 +1,58 @@
+[whisper_cpp]
+tag = "v1.9.5"
+commit = "d1be6fde11ac6e0407606b4e42fe72d34add8037"
+patch = "native/patches/0001-vad-timestamp-mapping.patch"
+patch_sha256 = "5dea476a89b6a7ac725cffeb72e2d80a33dc04ac0f0635dfe28cc4a25d911d1b"
+
+[whisper_cpp_macos]
+# The Mac engine's complete approved patch: the patch above plus one change,
+# speech detection never uses more threads than the run (ADR 0032, MAC11-VAD).
+# The Windows engine keeps the patch above until its next build.
+patch = "native/patches/0002-vad-timestamps-and-threads.patch"
+patch_sha256 = "8667cb407d80e1ac044728f323621ddcc911a76d533593282debbb274fdb2c91"
+
+[openai_whisper]
+commit = "86098128c0b4f24f0e2aa2994de830614b474227"
+
+[vulkan_sdk]
+version = "1.4.363.0"
+windows_installer_sha256 = "94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141"
+
+[ffmpeg]
+tag = "n9.0.2"
+commit = "946fcce07b6dcd0331c8cc609192aeff5e1924f8"
+
+[mingw_w64]
+ubuntu = "24.04"
+gcc_posix_package = "13.2.0-6ubuntu1+26.1"
+headers_package = "11.0.1-3build1"
+
+[silero_vad]
+version = "6.2.3"
+tag = "v6.2.3"
+commit = "5cd7945676eb32225748052e2e6a0580e4686a08"
+
+[engine_release]
+tag = "engine-v3"
+source_commit = "d0abc304942255a1d30d741fff0ca98c2c1cdf45"
+native_run_id = 40110881732
+ffmpeg_run_id = 39718973892
+whisper_cpu_zip_sha256 = "b47ec54df7ecb09b341bb7abc5f0f461f746f4bfe72b4873d5843340b9cef910"
+whisper_vulkan_zip_sha256 = "0e8f26c55c4abd7b708af1106027c2d75ed2d4592f103e10263f08e0c8d523c7"
+minimal_ffmpeg_zip_sha256 = "d687eb1e7403b6ab9c444118c055ac99521ea34782f52538787690d1e53da40c"
+
+[models_release]
+tag = "models-v1"
+manifest_sha256 = "6f8e4afd9665c18a14ff38d5541d9160110dc82ca47b6862918d86257c16277e"
+
+[engine_release_macos]
+# Built in dusty-corporation/dusty-staging from the reviewed tree of dusty-dev
+# commit dc4a0f4a874038a642edca4bdbf6aba0acda96d3,
+# with the speech detection threads patch (ADR 0032, MAC11-VAD).
+tag = "engine-macos-v2"
+built_in_repository = "dusty-corporation/dusty-staging"
+built_from_commit = "3433ea3b7023afa11eb484638104e32b8ee20bf5"
+built_by_run = 42542628054
+cpu_archive_sha256 = "c7f26b20056843f7a8bd72a5f620d01a33b28351b84b0f47b1d9ba42d5e8ed20"
+metal_archive_sha256 = "c0ead3a489206aa57f97aa1586e7de133ad15f1a7039374ca827483de01bcc57"
+ffmpeg_archive_sha256 = "6e7a9f06aed57fd8e0f53999799ec4e3f219d95598923ab5d558d2e15ffbc14d"
